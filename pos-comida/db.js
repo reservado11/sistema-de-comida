@@ -1,7 +1,13 @@
 const fs = require('fs');
 const path = require('path');
 
-const DB_PATH = path.join(__dirname, 'data', 'db.json');
+const IS_VERCEL = process.env.VERCEL === '1';
+
+const ORIGINAL_DB_PATH = path.join(__dirname, 'data', 'db.json');
+
+const DB_PATH = IS_VERCEL
+  ? path.join('/tmp', 'pos-comida', 'db.json')
+  : ORIGINAL_DB_PATH;
 
 function defaultData() {
   return {
@@ -30,22 +36,40 @@ function defaultData() {
 function ensureDB() {
   if (!fs.existsSync(DB_PATH)) {
     fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-    fs.writeFileSync(DB_PATH, JSON.stringify(defaultData(), null, 2));
+
+    if (IS_VERCEL && fs.existsSync(ORIGINAL_DB_PATH)) {
+      fs.copyFileSync(ORIGINAL_DB_PATH, DB_PATH);
+    } else {
+      fs.writeFileSync(
+        DB_PATH,
+        JSON.stringify(defaultData(), null, 2)
+      );
+    }
   }
 }
 
 function readDB() {
   ensureDB();
+
   const raw = fs.readFileSync(DB_PATH, 'utf-8');
   const data = JSON.parse(raw);
+
   // Compatibilidad con bases de datos creadas antes del cierre diario.
+
   if (!Array.isArray(data.closings)) data.closings = [];
+
   data.counters = data.counters || {};
+
   return data;
 }
+
 function writeDB(data) {
+  ensureDB();
+
   const tmp = DB_PATH + '.tmp';
+
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+
   fs.renameSync(tmp, DB_PATH);
 }
 
@@ -57,46 +81,97 @@ const COLLECTIONS = {
   closing: 'closings',
   user: 'users'
 };
+
 function nextId(db, counterKey) {
   db.counters = db.counters || {};
-  const list = Array.isArray(db[COLLECTIONS[counterKey]]) ? db[COLLECTIONS[counterKey]] : [];
-  const maxId = list.reduce((max, item) => Math.max(max, Number(item.id) || 0), 0);
-  const id = Math.max(db.counters[counterKey] || 1, maxId + 1);
+
+  const list = Array.isArray(db[COLLECTIONS[counterKey]])
+    ? db[COLLECTIONS[counterKey]]
+    : [];
+
+  const maxId = list.reduce(
+    (max, item) => Math.max(max, Number(item.id) || 0),
+    0
+  );
+
+  const id = Math.max(
+    db.counters[counterKey] || 1,
+    maxId + 1
+  );
+
   db.counters[counterKey] = id + 1;
+
   return id;
+}
+
 function repairDB() {
   ensureDB();
+
   const db = readDB();
+
   let changed = false;
 
   for (const key of ['product', 'ingredient', 'table']) {
     const list = db[COLLECTIONS[key]];
+
     if (!Array.isArray(list)) continue;
+
     const seen = new Set();
+
     for (const item of list) {
       if (seen.has(item.id)) {
         const oldId = item.id;
+
         item.id = nextId(db, key);
+
         changed = true;
+
         for (const order of (db.orders || [])) {
           if (order.status !== 'abierto') continue;
-          if (key === 'table' && order.tableId === oldId && order.tableName === item.name) order.tableId = item.id;
+
+          if (
+            key === 'table' &&
+            order.tableId === oldId &&
+            order.tableName === item.name
+          ) {
+            order.tableId = item.id;
+          }
+
           if (key === 'product') {
             for (const line of order.items || []) {
-              if (line.productId === oldId && line.name === item.name) line.productId = item.id;
+              if (
+                line.productId === oldId &&
+                line.name === item.name
+              ) {
+                line.productId = item.id;
+              }
             }
           }
         }
       }
+
       seen.add(item.id);
     }
   }
 
   if (changed) {
-    fs.copyFileSync(DB_PATH, DB_PATH + '.antes-de-reparar');
+    fs.copyFileSync(
+      DB_PATH,
+      DB_PATH + '.antes-de-reparar'
+    );
+
     writeDB(db);
-    console.log('Se repararon ids repetidos en la base de datos (copia: data/db.json.antes-de-reparar).');
+
+    console.log(
+      'Se repararon ids repetidos en la base de datos (copia: data/db.json.antes-de-reparar).'
+    );
   }
 }
 
-module.exports = { readDB, writeDB, nextId, ensureDB, repairDB };
+module.exports = {
+  readDB,
+  writeDB,
+  nextId,
+  ensureDB,
+  repairDB
+};
