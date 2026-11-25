@@ -1,13 +1,22 @@
 const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
-const { readDB, writeDB, nextId, ensureDB, repairDB } = require('./db');
 
-ensureDB();
-repairDB();
+const {
+  readDB,
+  writeDB,
+  nextId,
+  ensureDB,
+  repairDB
+} = require('./db');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+const asyncHandler = fn => (req, res, next) =>
+  Promise.resolve()
+    .then(() => fn(req, res, next))
+    .catch(next);
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -21,7 +30,13 @@ function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
 }
 
 function safeUser(user) {
-  return { id: user.id, name: user.name, username: user.username, role: user.role, active: user.active };
+  return {
+    id: user.id,
+    name: user.name,
+    username: user.username,
+    role: user.role,
+    active: user.active
+  };
 }
 
 function getCookie(req, name) {
@@ -30,165 +45,271 @@ function getCookie(req, name) {
   return item ? decodeURIComponent(item.slice(name.length + 1)) : null;
 }
 
-function createSession(db, user) {
+async function createSession(db, user) {
   const token = crypto.randomBytes(32).toString('hex');
   const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
 
   db.sessions = (db.sessions || []).filter(s => s.expiresAt > Date.now());
-  db.sessions.push({ tokenHash, userId: user.id, expiresAt: Date.now() + SESSION_DURATION_MS });
 
-  writeDB(db);
+  db.sessions.push({
+    tokenHash,
+    userId: user.id,
+    expiresAt: Date.now() + SESSION_DURATION_MS
+  });
+
+  await writeDB(db);
+
   return token;
 }
 
-function requireAuth(req, res, next) {
+const requireAuth = asyncHandler(async (req, res, next) => {
   const token = getCookie(req, SESSION_COOKIE);
 
-  if (!token) return res.status(401).json({ error: 'Debes iniciar sesión para continuar.' });
+  if (!token) {
+    return res.status(401).json({
+      error: 'Debes iniciar sesión para continuar.'
+    });
+  }
 
-  const db = readDB();
+  const db = req.db || await readDB();
+
   const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
 
-  const session = (db.sessions || []).find(s => s.tokenHash === tokenHash && s.expiresAt > Date.now());
-  const user = session && db.users && db.users.find(u => u.id === session.userId && u.active);
+  const session = (db.sessions || []).find(
+    s => s.tokenHash === tokenHash && s.expiresAt > Date.now()
+  );
 
-  if (!user) return res.status(401).json({ error: 'Tu sesión venció. Inicia sesión nuevamente.' });
+  const user = session && db.users &&
+    db.users.find(u => u.id === session.userId && u.active);
+
+  if (!user) {
+    return res.status(401).json({
+      error: 'Tu sesión venció. Inicia sesión nuevamente.'
+    });
+  }
 
   req.user = user;
   req.db = db;
 
   next();
-}
+});
 
 function requireAdmin(req, res, next) {
-  if (!req.user || req.user.role !== 'admin') return res.status(403).json({ error: 'Esta función solo está disponible para la administradora.' });
+  if (!req.user || req.user.role !== 'admin') {
+    return res.status(403).json({
+      error: 'Esta función solo está disponible para la administradora.'
+    });
+  }
 
   next();
 }
 
-app.get('/api/auth/status', (req, res) => {
-  const db = readDB();
-  res.json({ setupRequired: !Array.isArray(db.users) || db.users.length === 0 });
-});
+/* ============ AUTENTICACIÓN ============ */
 
-app.post('/api/auth/setup', (req, res) => {
-  const db = readDB();
+app.get('/api/auth/status', asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
-  if (Array.isArray(db.users) && db.users.length) return res.status(403).json({ error: 'La cuenta inicial ya fue creada.' });
+  res.json({
+    setupRequired: !Array.isArray(db.users) || db.users.length === 0
+  });
+}));
+
+app.post('/api/auth/setup', asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
+
+  if (Array.isArray(db.users) && db.users.length) {
+    return res.status(403).json({
+      error: 'La cuenta inicial ya fue creada.'
+    });
+  }
 
   const name = String(req.body.name || '').trim();
   const username = String(req.body.username || '').trim().toLowerCase();
   const password = String(req.body.password || '');
 
   if (!name || !/^[a-z0-9._-]{3,30}$/.test(username) || password.length < 8) {
-    return res.status(400).json({ error: 'Ingresa tu nombre, un usuario de 3 a 30 caracteres (letras, números, punto, guion) y una contraseña de mínimo 8 caracteres.' });
+    return res.status(400).json({
+      error: 'Ingresa tu nombre, un usuario de 3 a 30 caracteres (letras, números, punto, guion) y una contraseña de mínimo 8 caracteres.'
+    });
   }
 
   const secured = hashPassword(password);
 
-  const admin = { id: 1, name, username, role: 'admin', active: true, passwordHash: secured.hash, passwordSalt: secured.salt, createdAt: new Date().toISOString() };
+  const admin = {
+    id: 1,
+    name,
+    username,
+    role: 'admin',
+    active: true,
+    passwordHash: secured.hash,
+    passwordSalt: secured.salt,
+    createdAt: new Date().toISOString()
+  };
 
   db.users = [admin];
   db.counters = db.counters || {};
   db.counters.user = 2;
   db.sessions = [];
 
-  const token = createSession(db, admin);
+  const token = await createSession(db, admin);
 
-  res.setHeader('Set-Cookie', `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${Math.floor(SESSION_DURATION_MS / 1000)}`);
+  res.setHeader(
+    'Set-Cookie',
+    `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${Math.floor(SESSION_DURATION_MS / 1000)}`
+  );
 
-  res.status(201).json({ user: safeUser(admin) });
-});
+  res.status(201).json({
+    user: safeUser(admin)
+  });
+}));
 
-app.post('/api/auth/login', (req, res) => {
-  const db = readDB();
+app.post('/api/auth/login', asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
   const username = String(req.body.username || '').trim().toLowerCase();
   const password = String(req.body.password || '');
 
-  const user = (db.users || []).find(u => u.username === username && u.active);
+  const user = (db.users || []).find(
+    u => u.username === username && u.active
+  );
 
-  if (!user || !crypto.timingSafeEqual(Buffer.from(hashPassword(password, user.passwordSalt).hash, 'hex'), Buffer.from(user.passwordHash, 'hex'))) {
-    return res.status(401).json({ error: 'Usuario o contraseña incorrectos.' });
+  if (!user || !crypto.timingSafeEqual(
+    Buffer.from(hashPassword(password, user.passwordSalt).hash, 'hex'),
+    Buffer.from(user.passwordHash, 'hex')
+  )) {
+    return res.status(401).json({
+      error: 'Usuario o contraseña incorrectos.'
+    });
   }
 
-  const token = createSession(db, user);
+  const token = await createSession(db, user);
 
-  res.setHeader('Set-Cookie', `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${Math.floor(SESSION_DURATION_MS / 1000)}`);
+  res.setHeader(
+    'Set-Cookie',
+    `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${Math.floor(SESSION_DURATION_MS / 1000)}`
+  );
 
-  res.json({ user: safeUser(user) });
-});
+  res.json({
+    user: safeUser(user)
+  });
+}));
 
-app.post('/api/auth/logout', (req, res) => {
+app.post('/api/auth/logout', asyncHandler(async (req, res) => {
   const token = getCookie(req, SESSION_COOKIE);
-  const db = readDB();
+  const db = req.db || await readDB();
 
   if (token) {
     const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
 
-    db.sessions = (db.sessions || []).filter(s => s.tokenHash !== tokenHash);
+    db.sessions = (db.sessions || []).filter(
+      s => s.tokenHash !== tokenHash
+    );
 
-    writeDB(db);
+    await writeDB(db);
   }
 
-  res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`);
+  res.setHeader(
+    'Set-Cookie',
+    `${SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0`
+  );
 
   res.json({ ok: true });
+}));
+
+app.get('/api/auth/me', requireAuth, (req, res) => {
+  res.json({ user: safeUser(req.user) });
 });
 
-app.get('/api/auth/me', requireAuth, (req, res) => res.json({ user: safeUser(req.user) }));
+/* ============ USUARIOS ============ */
 
-app.get('/api/users', requireAuth, requireAdmin, (req, res) => {
-  const db = readDB();
+app.get('/api/users', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
+
   res.json((db.users || []).map(safeUser));
-});
+}));
 
-app.post('/api/users', requireAuth, requireAdmin, (req, res) => {
-  const db = readDB();
+app.post('/api/users', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
   const name = String(req.body.name || '').trim();
   const username = String(req.body.username || '').trim().toLowerCase();
   const password = String(req.body.password || '');
+
   const role = req.body.role === 'employee' ? 'employee' : 'admin';
 
   if (!name || !/^[a-z0-9._-]{3,30}$/.test(username) || password.length < 8) {
-    return res.status(400).json({ error: 'Completa el nombre, un usuario válido y una contraseña de mínimo 8 caracteres.' });
+    return res.status(400).json({
+      error: 'Completa el nombre, un usuario válido y una contraseña de mínimo 8 caracteres.'
+    });
   }
 
-  if ((db.users || []).some(u => u.username === username)) return res.status(409).json({ error: 'Ese nombre de usuario ya existe.' });
+  if ((db.users || []).some(u => u.username === username)) {
+    return res.status(409).json({
+      error: 'Ese nombre de usuario ya existe.'
+    });
+  }
 
   const secured = hashPassword(password);
 
-  const user = { id: nextId(db, 'user'), name, username, role, active: true, passwordHash: secured.hash, passwordSalt: secured.salt, createdAt: new Date().toISOString() };
+  const user = {
+    id: nextId(db, 'user'),
+    name,
+    username,
+    role,
+    active: true,
+    passwordHash: secured.hash,
+    passwordSalt: secured.salt,
+    createdAt: new Date().toISOString()
+  };
 
   db.users.push(user);
 
-  writeDB(db);
+  await writeDB(db);
 
   res.status(201).json(safeUser(user));
-});
+}));
 
-app.patch('/api/users/:id/status', requireAuth, requireAdmin, (req, res) => {
-  const db = readDB();
+app.patch('/api/users/:id/status', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
-  const user = (db.users || []).find(u => u.id === Number(req.params.id));
+  const user = (db.users || []).find(
+    u => u.id === Number(req.params.id)
+  );
 
-  if (!user) return res.status(404).json({ error: 'Usuario no encontrado.' });
+  if (!user) {
+    return res.status(404).json({
+      error: 'Usuario no encontrado.'
+    });
+  }
 
-  if (user.id === req.user.id) return res.status(400).json({ error: 'No puedes desactivar tu propia cuenta.' });
+  if (user.id === req.user.id) {
+    return res.status(400).json({
+      error: 'No puedes desactivar tu propia cuenta.'
+    });
+  }
 
-  if (!req.body.active && user.role === 'admin' && (db.users || []).filter(u => u.role === 'admin' && u.active).length <= 1) {
-    return res.status(400).json({ error: 'Debe quedar al menos una cuenta administradora activa.' });
+  if (
+    !req.body.active &&
+    user.role === 'admin' &&
+    (db.users || []).filter(u => u.role === 'admin' && u.active).length <= 1
+  ) {
+    return res.status(400).json({
+      error: 'Debe quedar al menos una cuenta administradora activa.'
+    });
   }
 
   user.active = Boolean(req.body.active);
 
-  if (!user.active) db.sessions = (db.sessions || []).filter(s => s.userId !== user.id);
+  if (!user.active) {
+    db.sessions = (db.sessions || []).filter(
+      s => s.userId !== user.id
+    );
+  }
 
-  writeDB(db);
+  await writeDB(db);
 
   res.json(safeUser(user));
-});
+}));
 
 app.use('/api', (req, res, next) => {
   if (req.path.startsWith('/auth/')) return next();
@@ -198,17 +319,22 @@ app.use('/api', (req, res, next) => {
 
 /* ============ PRODUCTOS (MENÚ) ============ */
 
-app.get('/api/products', (req, res) => {
-  const db = readDB();
-  res.json(db.products);
-});
+app.get('/api/products', asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
-app.post('/api/products', requireAuth, requireAdmin, (req, res) => {
-  const db = readDB();
+  res.json(db.products);
+}));
+
+app.post('/api/products', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
   const { name, category, price, cost, recipe } = req.body;
 
-  if (!name || price == null) return res.status(400).json({ error: 'Nombre y precio son obligatorios' });
+  if (!name || price == null) {
+    return res.status(400).json({
+      error: 'Nombre y precio son obligatorios'
+    });
+  }
 
   const product = {
     id: nextId(db, 'product'),
@@ -216,56 +342,70 @@ app.post('/api/products', requireAuth, requireAdmin, (req, res) => {
     category: category || 'General',
     price: Number(price),
     cost: Number(cost) || 0,
-    recipe: Array.isArray(recipe) ? recipe : [] // [{ingredientId, qty}]
+    recipe: Array.isArray(recipe) ? recipe : []
   };
 
   db.products.push(product);
 
-  writeDB(db);
+  await writeDB(db);
 
   res.status(201).json(product);
-});
+}));
 
-app.put('/api/products/:id', requireAuth, requireAdmin, (req, res) => {
-  const db = readDB();
+app.put('/api/products/:id', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
   const id = Number(req.params.id);
+
   const idx = db.products.findIndex(p => p.id === id);
 
-  if (idx === -1) return res.status(404).json({ error: 'Producto no encontrado' });
+  if (idx === -1) {
+    return res.status(404).json({
+      error: 'Producto no encontrado'
+    });
+  }
 
-  db.products[idx] = { ...db.products[idx], ...req.body, id };
+  db.products[idx] = {
+    ...db.products[idx],
+    ...req.body,
+    id
+  };
 
-  writeDB(db);
+  await writeDB(db);
 
   res.json(db.products[idx]);
-});
+}));
 
-app.delete('/api/products/:id', requireAuth, requireAdmin, (req, res) => {
-  const db = readDB();
+app.delete('/api/products/:id', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
   const id = Number(req.params.id);
 
   db.products = db.products.filter(p => p.id !== id);
 
-  writeDB(db);
+  await writeDB(db);
 
   res.json({ ok: true });
-});
+}));
 
 /* ============ INGREDIENTES (INVENTARIO) ============ */
 
-app.get('/api/ingredients', (req, res) => {
-  const db = readDB();
-  res.json(db.ingredients);
-});
+app.get('/api/ingredients', asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
-app.post('/api/ingredients', requireAuth, requireAdmin, (req, res) => {
-  const db = readDB();
+  res.json(db.ingredients);
+}));
+
+app.post('/api/ingredients', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
   const { name, unit, stock, minStock } = req.body;
 
-  if (!name) return res.status(400).json({ error: 'Nombre obligatorio' });
+  if (!name) {
+    return res.status(400).json({
+      error: 'Nombre obligatorio'
+    });
+  }
 
   const ingredient = {
     id: nextId(db, 'ingredient'),
@@ -277,132 +417,200 @@ app.post('/api/ingredients', requireAuth, requireAdmin, (req, res) => {
 
   db.ingredients.push(ingredient);
 
-  writeDB(db);
+  await writeDB(db);
 
   res.status(201).json(ingredient);
-});
+}));
 
-app.put('/api/ingredients/:id', requireAuth, requireAdmin, (req, res) => {
-  const db = readDB();
+app.put('/api/ingredients/:id', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
   const id = Number(req.params.id);
+
   const idx = db.ingredients.findIndex(i => i.id === id);
 
-  if (idx === -1) return res.status(404).json({ error: 'Ingrediente no encontrado' });
+  if (idx === -1) {
+    return res.status(404).json({
+      error: 'Ingrediente no encontrado'
+    });
+  }
 
-  db.ingredients[idx] = { ...db.ingredients[idx], ...req.body, id };
+  db.ingredients[idx] = {
+    ...db.ingredients[idx],
+    ...req.body,
+    id
+  };
 
-  writeDB(db);
+  await writeDB(db);
 
   res.json(db.ingredients[idx]);
-});
+}));
 
-app.delete('/api/ingredients/:id', requireAuth, requireAdmin, (req, res) => {
-  const db = readDB();
+app.delete('/api/ingredients/:id', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
   const id = Number(req.params.id);
 
   db.ingredients = db.ingredients.filter(i => i.id !== id);
 
-  writeDB(db);
+  await writeDB(db);
 
   res.json({ ok: true });
-});
+}));
 
 /* ============ MESAS ============ */
 
-app.get('/api/tables', (req, res) => {
-  const db = readDB();
-  res.json(db.tables);
-});
+app.get('/api/tables', asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
-app.post('/api/tables', requireAuth, requireAdmin, (req, res) => {
-  const db = readDB();
+  res.json(db.tables);
+}));
+
+app.post('/api/tables', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
   const { name } = req.body;
 
-  const table = { id: nextId(db, 'table'), name: name || `Mesa ${db.counters.table}`, status: 'libre' };
+  const table = {
+    id: nextId(db, 'table'),
+    name: name || `Mesa ${db.counters.table}`,
+    status: 'libre'
+  };
 
   db.tables.push(table);
 
-  writeDB(db);
+  await writeDB(db);
 
   res.status(201).json(table);
-});
+}));
 
-app.put('/api/tables/:id', requireAuth, requireAdmin, (req, res) => {
-  const db = readDB();
+app.put('/api/tables/:id', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
   const id = Number(req.params.id);
+
   const idx = db.tables.findIndex(t => t.id === id);
 
-  if (idx === -1) return res.status(404).json({ error: 'Mesa no encontrada' });
+  if (idx === -1) {
+    return res.status(404).json({
+      error: 'Mesa no encontrada'
+    });
+  }
 
-  db.tables[idx] = { ...db.tables[idx], ...req.body, id };
+  db.tables[idx] = {
+    ...db.tables[idx],
+    ...req.body,
+    id
+  };
 
-  writeDB(db);
+  await writeDB(db);
 
   res.json(db.tables[idx]);
-});
+}));
 
-app.delete('/api/tables/:id', requireAuth, requireAdmin, (req, res) => {
-  const db = readDB();
+app.delete('/api/tables/:id', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
   const id = Number(req.params.id);
 
   db.tables = db.tables.filter(t => t.id !== id);
 
-  writeDB(db);
+  await writeDB(db);
 
   res.json({ ok: true });
-});
+}));
 
-/* ============ UTILIDADES (zona horaria, textos, pagos) ============ */
+/* ============ UTILIDADES ============ */
 
 const TIMEZONE = process.env.POS_TIMEZONE || 'America/Bogota';
 
-const dayFormatter = new Intl.DateTimeFormat('en-CA', { timeZone: TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit' });
+const dayFormatter = new Intl.DateTimeFormat('en-CA', {
+  timeZone: TIMEZONE,
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit'
+});
 
 const localDay = value => dayFormatter.format(new Date(value));
-const todayLocal = () => localDay(new Date());
-const isDay = value => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value);
 
-const PAYMENT_METHODS = ['efectivo', 'tarjeta', 'transferencia', 'nequi', 'daviplata'];
-const ORDER_TYPES = ['mostrador', 'mesa', 'domicilio'];
+const todayLocal = () => localDay(new Date());
+
+const isDay = value =>
+  typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value);
+
+const PAYMENT_METHODS = [
+  'efectivo',
+  'tarjeta',
+  'transferencia',
+  'nequi',
+  'daviplata'
+];
+
+const ORDER_TYPES = [
+  'mostrador',
+  'mesa',
+  'domicilio'
+];
 
 function cleanText(value, max) {
-  return String(value == null ? '' : value).replace(/\s+/g, ' ').trim().slice(0, max);
+  return String(value == null ? '' : value)
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, max);
 }
 
 function money(value) {
   return Math.round(Number(value) * 100) / 100;
 }
 
-// Devuelve los pagos de un pedido. Los pedidos antiguos (un solo método) se convierten al formato nuevo.
-
 function orderPayments(order) {
-  if (Array.isArray(order.payments) && order.payments.length) return order.payments;
+  if (Array.isArray(order.payments) && order.payments.length) {
+    return order.payments;
+  }
 
-  const method = PAYMENT_METHODS.includes(order.paymentMethod) ? order.paymentMethod : 'efectivo';
+  const method = PAYMENT_METHODS.includes(order.paymentMethod)
+    ? order.paymentMethod
+    : 'efectivo';
 
-  return [{ method, amount: order.total, received: order.amountPaid != null ? order.amountPaid : order.total }];
+  return [{
+    method,
+    amount: order.total,
+    received: order.amountPaid != null
+      ? order.amountPaid
+      : order.total
+  }];
 }
 
 function buildItems(db, items) {
-  if (!Array.isArray(items)) return { error: 'La lista de productos no es válida.' };
+  if (!Array.isArray(items)) {
+    return {
+      error: 'La lista de productos no es válida.'
+    };
+  }
 
   const result = [];
 
   for (const it of items) {
-    const product = db.products.find(p => p.id === Number(it.productId));
+    const product = db.products.find(
+      p => p.id === Number(it.productId)
+    );
 
     if (!product) continue;
 
     const qty = it.qty == null ? 1 : Number(it.qty);
 
-    if (!Number.isInteger(qty) || qty < 1 || qty > 999) return { error: 'Cada producto debe tener una cantidad entera entre 1 y 999.' };
+    if (!Number.isInteger(qty) || qty < 1 || qty > 999) {
+      return {
+        error: 'Cada producto debe tener una cantidad entera entre 1 y 999.'
+      };
+    }
 
-    const line = { productId: product.id, name: product.name, price: product.price, qty };
+    const line = {
+      productId: product.id,
+      name: product.name,
+      price: product.price,
+      qty
+    };
 
     const note = cleanText(it.note, 120);
 
@@ -415,9 +623,14 @@ function buildItems(db, items) {
 }
 
 function computeTotals(order) {
-  order.subtotal = order.items.reduce((sum, i) => sum + i.price * i.qty, 0);
+  order.subtotal = order.items.reduce(
+    (sum, i) => sum + i.price * i.qty,
+    0
+  );
 
-  order.deliveryFee = order.type === 'domicilio' ? money(order.deliveryFee || 0) : 0;
+  order.deliveryFee = order.type === 'domicilio'
+    ? money(order.deliveryFee || 0)
+    : 0;
 
   order.total = order.subtotal + order.deliveryFee;
 }
@@ -428,10 +641,19 @@ function resolvePayments(body, total) {
   if (!Array.isArray(list)) {
     const method = body.paymentMethod || 'efectivo';
 
-    list = [{ method, amount: method === 'efectivo' ? body.amountPaid : total }];
+    list = [{
+      method,
+      amount: method === 'efectivo'
+        ? body.amountPaid
+        : total
+    }];
   }
 
-  if (!list.length) return { error: 'Registra al menos un pago.' };
+  if (!list.length) {
+    return {
+      error: 'Registra al menos un pago.'
+    };
+  }
 
   const received = {};
 
@@ -439,84 +661,145 @@ function resolvePayments(body, total) {
     const method = String(p.method || '');
     const amount = money(p.amount);
 
-    if (!PAYMENT_METHODS.includes(method)) return { error: 'Método de pago inválido.' };
+    if (!PAYMENT_METHODS.includes(method)) {
+      return {
+        error: 'Método de pago inválido.'
+      };
+    }
 
-    if (!Number.isFinite(amount) || amount <= 0) return { error: 'Cada pago debe tener un valor mayor a cero.' };
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return {
+        error: 'Cada pago debe tener un valor mayor a cero.'
+      };
+    }
 
-    received[method] = money((received[method] || 0) + amount);
+    received[method] = money(
+      (received[method] || 0) + amount
+    );
   }
 
   const cashReceived = received.efectivo || 0;
 
-  const nonCash = money(Object.entries(received).filter(([m]) => m !== 'efectivo').reduce((s, [, v]) => s + v, 0));
+  const nonCash = money(
+    Object.entries(received)
+      .filter(([m]) => m !== 'efectivo')
+      .reduce((s, [, v]) => s + v, 0)
+  );
 
-  if (nonCash > total) return { error: 'Los pagos que no son en efectivo no pueden superar el total del pedido.' };
+  if (nonCash > total) {
+    return {
+      error: 'Los pagos que no son en efectivo no pueden superar el total del pedido.'
+    };
+  }
 
   const cashDue = money(total - nonCash);
 
-  if (cashReceived > 0 && cashDue <= 0) return { error: 'El total ya está cubierto sin efectivo; quita el pago en efectivo.' };
+  if (cashReceived > 0 && cashDue <= 0) {
+    return {
+      error: 'El total ya está cubierto sin efectivo; quita el pago en efectivo.'
+    };
+  }
 
-  if (money(cashReceived + nonCash) < total) return { error: 'El dinero recibido no puede ser menor al total.' };
+  if (money(cashReceived + nonCash) < total) {
+    return {
+      error: 'El dinero recibido no puede ser menor al total.'
+    };
+  }
 
-  const payments = Object.entries(received).map(([method, amount]) => (
-    method === 'efectivo'
-      ? { method, amount: cashDue, received: cashReceived }
-      : { method, amount, received: amount }
-  ));
+  const payments = Object.entries(received).map(
+    ([method, amount]) => (
+      method === 'efectivo'
+        ? {
+            method,
+            amount: cashDue,
+            received: cashReceived
+          }
+        : {
+            method,
+            amount,
+            received: amount
+          }
+    )
+  );
 
   const change = money(cashReceived - cashDue);
 
-  return { payments, change, amountPaid: money(cashReceived + nonCash) };
+  return {
+    payments,
+    change,
+    amountPaid: money(cashReceived + nonCash)
+  };
 }
 
 /* ============ CONFIGURACIÓN ============ */
 
 app.get('/api/config', (req, res) => {
-  res.json({ timezone: TIMEZONE, today: todayLocal() });
+  res.json({
+    timezone: TIMEZONE,
+    today: todayLocal()
+  });
 });
 
 /* ============ PEDIDOS ============ */
 
-app.get('/api/orders', (req, res) => {
-  const db = readDB();
+app.get('/api/orders', asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
   let orders = db.orders;
 
   const { status, date } = req.query;
 
-  if (status) orders = orders.filter(o => o.status === status);
+  if (status) {
+    orders = orders.filter(o => o.status === status);
+  }
 
-  if (date) orders = orders.filter(o => localDay(o.createdAt) === date);
+  if (date) {
+    orders = orders.filter(o => localDay(o.createdAt) === date);
+  }
 
   res.json([...orders].sort((a, b) => b.id - a.id));
-});
+}));
 
-app.get('/api/orders/:id', (req, res) => {
-  const db = readDB();
+app.get('/api/orders/:id', asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
-  const order = db.orders.find(o => o.id === Number(req.params.id));
+  const order = db.orders.find(
+    o => o.id === Number(req.params.id)
+  );
 
-  if (!order) return res.status(404).json({ error: 'Pedido no encontrado' });
+  if (!order) {
+    return res.status(404).json({
+      error: 'Pedido no encontrado'
+    });
+  }
 
   res.json(order);
-});
+}));
 
-// Crear un pedido nuevo (mostrador, mesa o domicilio)
-
-app.post('/api/orders', (req, res) => {
-  const db = readDB();
+app.post('/api/orders', asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
   const { type, tableId, items } = req.body;
 
   if (!type || !ORDER_TYPES.includes(type)) {
-    return res.status(400).json({ error: 'Tipo de pedido inválido (mostrador, mesa o domicilio)' });
+    return res.status(400).json({
+      error: 'Tipo de pedido inválido (mostrador, mesa o domicilio)'
+    });
   }
 
   const built = buildItems(db, items);
 
-  if (built.error) return res.status(400).json({ error: built.error });
+  if (built.error) {
+    return res.status(400).json({
+      error: built.error
+    });
+  }
 
-  if (!built.items.length) return res.status(400).json({ error: 'Agrega al menos un producto al pedido.' });
+  if (!built.items.length) {
+    return res.status(400).json({
+      error: 'Agrega al menos un producto al pedido.'
+    });
+  }
 
   const order = {
     id: nextId(db, 'order'),
@@ -528,20 +811,30 @@ app.post('/api/orders', (req, res) => {
     customerAddress: null,
     deliveryFee: 0,
     notes: cleanText(req.body.notes, 300),
-    items: built.items, // {productId, name, price, qty, note?}
+    items: built.items,
     subtotal: 0,
     total: 0,
-    status: 'abierto', // abierto -> pagado / cancelado
+    status: 'abierto',
     createdAt: new Date().toISOString(),
     closedAt: null
   };
 
   if (type === 'mesa') {
-    const table = db.tables.find(t => t.id === Number(tableId));
+    const table = db.tables.find(
+      t => t.id === Number(tableId)
+    );
 
-    if (!table) return res.status(400).json({ error: 'Selecciona una mesa válida.' });
+    if (!table) {
+      return res.status(400).json({
+        error: 'Selecciona una mesa válida.'
+      });
+    }
 
-    if (table.status !== 'libre') return res.status(409).json({ error: `${table.name} ya está ocupada.` });
+    if (table.status !== 'libre') {
+      return res.status(409).json({
+        error: `${table.name} ya está ocupada.`
+      });
+    }
 
     order.tableId = table.id;
     order.tableName = table.name;
@@ -554,18 +847,27 @@ app.post('/api/orders', (req, res) => {
     order.customerPhone = cleanText(req.body.customerPhone, 25);
     order.customerAddress = cleanText(req.body.customerAddress, 160);
 
-    const fee = req.body.deliveryFee == null || req.body.deliveryFee === '' ? 0 : money(req.body.deliveryFee);
+    const fee = req.body.deliveryFee == null ||
+      req.body.deliveryFee === ''
+      ? 0
+      : money(req.body.deliveryFee);
 
     if (!order.customerName || !order.customerPhone || !order.customerAddress) {
-      return res.status(400).json({ error: 'En un domicilio debes indicar nombre, teléfono y dirección del cliente.' });
+      return res.status(400).json({
+        error: 'En un domicilio debes indicar nombre, teléfono y dirección del cliente.'
+      });
     }
 
     if (!/^[0-9+()\-\s]{7,25}$/.test(order.customerPhone)) {
-      return res.status(400).json({ error: 'El teléfono del cliente no es válido.' });
+      return res.status(400).json({
+        error: 'El teléfono del cliente no es válido.'
+      });
     }
 
     if (!Number.isFinite(fee) || fee < 0 || fee > 1000000) {
-      return res.status(400).json({ error: 'El valor del domicilio no es válido.' });
+      return res.status(400).json({
+        error: 'El valor del domicilio no es válido.'
+      });
     }
 
     order.deliveryFee = fee;
@@ -575,58 +877,103 @@ app.post('/api/orders', (req, res) => {
 
   db.orders.push(order);
 
-  writeDB(db);
+  await writeDB(db);
 
   res.status(201).json(order);
-});
+}));
 
-app.put('/api/orders/:id/items', (req, res) => {
-  const db = readDB();
+app.put('/api/orders/:id/items', asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
-  const order = db.orders.find(o => o.id === Number(req.params.id));
+  const order = db.orders.find(
+    o => o.id === Number(req.params.id)
+  );
 
-  if (!order) return res.status(404).json({ error: 'Pedido no encontrado' });
+  if (!order) {
+    return res.status(404).json({
+      error: 'Pedido no encontrado'
+    });
+  }
 
-  if (order.status !== 'abierto') return res.status(400).json({ error: 'El pedido ya está cerrado' });
+  if (order.status !== 'abierto') {
+    return res.status(400).json({
+      error: 'El pedido ya está cerrado'
+    });
+  }
 
   const built = buildItems(db, req.body.items);
 
-  if (built.error) return res.status(400).json({ error: built.error });
+  if (built.error) {
+    return res.status(400).json({
+      error: built.error
+    });
+  }
 
-  if (!built.items.length) return res.status(400).json({ error: 'El pedido debe tener al menos un producto.' });
+  if (!built.items.length) {
+    return res.status(400).json({
+      error: 'El pedido debe tener al menos un producto.'
+    });
+  }
 
   order.items = built.items;
 
-  if (req.body.notes !== undefined) order.notes = cleanText(req.body.notes, 300);
+  if (req.body.notes !== undefined) {
+    order.notes = cleanText(req.body.notes, 300);
+  }
 
   computeTotals(order);
 
-  writeDB(db);
+  await writeDB(db);
 
   res.json(order);
-});
+}));
 
-app.post('/api/orders/:id/pay', (req, res) => {
-  const db = readDB();
+/* ============ PAGAR PEDIDO ============ */
 
-  const order = db.orders.find(o => o.id === Number(req.params.id));
+app.post('/api/orders/:id/pay', asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
-  if (!order) return res.status(404).json({ error: 'Pedido no encontrado' });
+  const order = db.orders.find(
+    o => o.id === Number(req.params.id)
+  );
 
-  if (order.status !== 'abierto') return res.status(400).json({ error: 'El pedido ya está cerrado' });
+  if (!order) {
+    return res.status(404).json({
+      error: 'Pedido no encontrado'
+    });
+  }
+
+  if (order.status !== 'abierto') {
+    return res.status(400).json({
+      error: 'El pedido ya está cerrado'
+    });
+  }
 
   const result = resolvePayments(req.body, order.total);
 
-  if (result.error) return res.status(400).json({ error: result.error });
+  if (result.error) {
+    return res.status(400).json({
+      error: result.error
+    });
+  }
 
   for (const item of order.items) {
-    const product = db.products.find(p => p.id === item.productId);
+    const product = db.products.find(
+      p => p.id === item.productId
+    );
 
     if (product && Array.isArray(product.recipe)) {
       for (const ing of product.recipe) {
-        const ingredient = db.ingredients.find(i => i.id === ing.ingredientId);
+        const ingredient = db.ingredients.find(
+          i => i.id === ing.ingredientId
+        );
 
-        if (ingredient) ingredient.stock = Math.max(0, ingredient.stock - Number(ing.qty || 0) * item.qty);
+        if (ingredient) {
+          ingredient.stock = Math.max(
+            0,
+            ingredient.stock - Number(ing.qty || 0) * item.qty
+          );
+        }
       }
     }
   }
@@ -634,65 +981,91 @@ app.post('/api/orders/:id/pay', (req, res) => {
   order.status = 'pagado';
   order.closedAt = new Date().toISOString();
   order.payments = result.payments;
-  order.paymentMethod = result.payments.length > 1 ? 'mixto' : result.payments[0].method;
+
+  order.paymentMethod = result.payments.length > 1
+    ? 'mixto'
+    : result.payments[0].method;
+
   order.amountPaid = result.amountPaid;
   order.change = result.change;
-  order.paidBy = { id: req.user.id, name: req.user.name };
+
+  order.paidBy = {
+    id: req.user.id,
+    name: req.user.name
+  };
 
   if (order.type === 'mesa' && order.tableId) {
-    const table = db.tables.find(t => t.id === order.tableId);
+    const table = db.tables.find(
+      t => t.id === order.tableId
+    );
 
     if (table) table.status = 'libre';
   }
 
-  writeDB(db);
+  await writeDB(db);
 
   res.json(order);
-});
+}));
 
-app.post('/api/orders/:id/cancel', (req, res) => {
-  const db = readDB();
+/* ============ CANCELAR PEDIDO ============ */
 
-  const order = db.orders.find(o => o.id === Number(req.params.id));
+app.post('/api/orders/:id/cancel', asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
-  if (!order) return res.status(404).json({ error: 'Pedido no encontrado' });
+  const order = db.orders.find(
+    o => o.id === Number(req.params.id)
+  );
 
-  // Un pedido pagado no se cancela: ya descontó inventario y suma en caja.
+  if (!order) {
+    return res.status(404).json({
+      error: 'Pedido no encontrado'
+    });
+  }
 
-  if (order.status !== 'abierto') return res.status(400).json({ error: 'Solo se pueden cancelar pedidos abiertos.' });
+  if (order.status !== 'abierto') {
+    return res.status(400).json({
+      error: 'Solo se pueden cancelar pedidos abiertos.'
+    });
+  }
 
   order.status = 'cancelado';
   order.closedAt = new Date().toISOString();
 
   if (order.type === 'mesa' && order.tableId) {
-    const table = db.tables.find(t => t.id === order.tableId);
+    const table = db.tables.find(
+      t => t.id === order.tableId
+    );
 
     if (table) table.status = 'libre';
   }
 
-  writeDB(db);
+  await writeDB(db);
 
   res.json(order);
-});
+}));
 
 /* ============ VENTAS ============ */
 
-app.get('/api/sales', (req, res) => {
-  const db = readDB();
+app.get('/api/sales', asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
   const sales = db.orders
     .filter(o => o.status === 'pagado')
     .sort((a, b) => new Date(b.closedAt) - new Date(a.closedAt));
 
   res.json(sales);
-});
+}));
 
 /* ============ REPORTES ============ */
 
 function summarizeOrders(paid) {
   const byMethod = {};
 
-  const byType = { mostrador: { count: 0, total: 0 }, mesa: { count: 0, total: 0 }, domicilio: { count: 0, total: 0 } };
+  const byType = {
+    mostrador: { count: 0, total: 0 },
+    mesa: { count: 0, total: 0 },
+    domicilio: { count: 0, total: 0 }
+  };
 
   let totalSales = 0;
   let deliveryFees = 0;
@@ -706,7 +1079,11 @@ function summarizeOrders(paid) {
       byType[o.type].total += o.total;
     }
 
-    for (const p of orderPayments(o)) byMethod[p.method] = money((byMethod[p.method] || 0) + p.amount);
+    for (const p of orderPayments(o)) {
+      byMethod[p.method] = money(
+        (byMethod[p.method] || 0) + p.amount
+      );
+    }
   }
 
   return {
@@ -720,30 +1097,45 @@ function summarizeOrders(paid) {
   };
 }
 
-app.get('/api/reports/summary', requireAuth, requireAdmin, (req, res) => {
-  const db = readDB();
+app.get('/api/reports/summary', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
   const today = todayLocal();
 
-  const from = isDay(req.query.from) ? req.query.from : (isDay(req.query.to) ? null : today);
+  const from = isDay(req.query.from)
+    ? req.query.from
+    : (isDay(req.query.to) ? null : today);
 
-  const to = isDay(req.query.to) ? req.query.to : (isDay(req.query.from) ? null : today);
+  const to = isDay(req.query.to)
+    ? req.query.to
+    : (isDay(req.query.from) ? null : today);
 
-  if (from && to && from > to) return res.status(400).json({ error: 'La fecha "Desde" no puede ser posterior a "Hasta".' });
+  if (from && to && from > to) {
+    return res.status(400).json({
+      error: 'La fecha "Desde" no puede ser posterior a "Hasta".'
+    });
+  }
 
   const inRange = iso => {
     const day = localDay(iso);
 
-    return (!from || day >= from) && (!to || day <= to);
+    return (!from || day >= from) &&
+      (!to || day <= to);
   };
 
-  const filtered = db.orders.filter(o => o.status === 'pagado' && o.closedAt && inRange(o.closedAt));
+  const filtered = db.orders.filter(
+    o => o.status === 'pagado' &&
+      o.closedAt &&
+      inRange(o.closedAt)
+  );
 
-  const cancelled = db.orders.filter(o => o.status === 'cancelado' && o.closedAt && inRange(o.closedAt));
+  const cancelled = db.orders.filter(
+    o => o.status === 'cancelado' &&
+      o.closedAt &&
+      inRange(o.closedAt)
+  );
 
   const summary = summarizeOrders(filtered);
-
-  // Ventas por día
 
   const porDia = {};
 
@@ -753,13 +1145,16 @@ app.get('/api/reports/summary', requireAuth, requireAdmin, (req, res) => {
     porDia[day] = (porDia[day] || 0) + o.total;
   }
 
-  // Productos más vendidos
-
   const productCount = {};
 
   for (const o of filtered) {
     for (const item of o.items) {
-      if (!productCount[item.name]) productCount[item.name] = { qty: 0, total: 0 };
+      if (!productCount[item.name]) {
+        productCount[item.name] = {
+          qty: 0,
+          total: 0
+        };
+      }
 
       productCount[item.name].qty += item.qty;
       productCount[item.name].total += item.price * item.qty;
@@ -771,40 +1166,64 @@ app.get('/api/reports/summary', requireAuth, requireAdmin, (req, res) => {
     .sort((a, b) => b.qty - a.qty);
 
   res.json({
-    from, to, timezone: TIMEZONE,
+    from,
+    to,
+    timezone: TIMEZONE,
     totalVentas: summary.totalSales,
     totalPedidos: summary.ordersCount,
-    ticketPromedio: summary.ordersCount ? Math.round(summary.totalSales / summary.ordersCount) : 0,
+    ticketPromedio: summary.ordersCount
+      ? Math.round(summary.totalSales / summary.ordersCount)
+      : 0,
     totalDomicilios: summary.deliveryFees,
     pedidosCancelados: cancelled.length,
     porMetodo: summary.byMethod,
     porTipo: summary.byType,
     porDia,
     topProductos,
-    ingredientesBajoStock: db.ingredients.filter(i => i.stock <= i.minStock)
+    ingredientesBajoStock: db.ingredients.filter(
+      i => i.stock <= i.minStock
+    )
   });
-});
+}));
+
+/* ============ CIERRES DE CAJA ============ */
 
 function pendingClosing(db) {
-  const paid = db.orders.filter(o => o.status === 'pagado' && !o.closingId);
+  const paid = db.orders.filter(
+    o => o.status === 'pagado' && !o.closingId
+  );
 
-  const cancelled = db.orders.filter(o => o.status === 'cancelado' && !o.closingId);
+  const cancelled = db.orders.filter(
+    o => o.status === 'cancelado' && !o.closingId
+  );
 
-  const open = db.orders.filter(o => o.status === 'abierto');
+  const open = db.orders.filter(
+    o => o.status === 'abierto'
+  );
 
   return { paid, cancelled, open };
 }
 
 function periodOf(paid) {
-  if (!paid.length) return { periodFrom: null, periodTo: null };
+  if (!paid.length) {
+    return {
+      periodFrom: null,
+      periodTo: null
+    };
+  }
 
-  const days = paid.map(o => localDay(o.closedAt)).sort();
+  const days = paid.map(
+    o => localDay(o.closedAt)
+  ).sort();
 
-  return { periodFrom: days[0], periodTo: days[days.length - 1] };
+  return {
+    periodFrom: days[0],
+    periodTo: days[days.length - 1]
+  };
 }
 
-app.get('/api/closings/preview', (req, res) => {
-  const db = readDB();
+app.get('/api/closings/preview', asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
   const { paid, cancelled, open } = pendingClosing(db);
 
@@ -816,30 +1235,53 @@ app.get('/api/closings/preview', (req, res) => {
     openOrders: open.length,
     openOrdersTotal: open.reduce((s, o) => s + o.total, 0)
   });
-});
+}));
 
-app.post('/api/closings', (req, res) => {
-  const db = readDB();
+app.post('/api/closings', asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
   const { paid, cancelled, open } = pendingClosing(db);
 
-  if (!paid.length) return res.status(400).json({ error: 'No hay ventas pendientes por cerrar.' });
-
-  if (open.length && !req.body.allowOpenOrders) {
-    return res.status(409).json({ code: 'OPEN_ORDERS', error: `Hay ${open.length} pedido(s) abierto(s) sin pagar. Cóbralos o cancélalos antes de cerrar el día.` });
+  if (!paid.length) {
+    return res.status(400).json({
+      error: 'No hay ventas pendientes por cerrar.'
+    });
   }
 
-  const openingCash = req.body.openingCash === '' || req.body.openingCash == null ? 0 : money(req.body.openingCash);
+  if (open.length && !req.body.allowOpenOrders) {
+    return res.status(409).json({
+      code: 'OPEN_ORDERS',
+      error: `Hay ${open.length} pedido(s) abierto(s) sin pagar. Cóbralos o cancélalos antes de cerrar el día.`
+    });
+  }
 
-  const countedCash = req.body.countedCash === '' || req.body.countedCash == null ? NaN : money(req.body.countedCash);
+  const openingCash = req.body.openingCash === '' ||
+    req.body.openingCash == null
+    ? 0
+    : money(req.body.openingCash);
 
-  if (!Number.isFinite(openingCash) || openingCash < 0) return res.status(400).json({ error: 'La base inicial de caja no es válida.' });
+  const countedCash = req.body.countedCash === '' ||
+    req.body.countedCash == null
+    ? NaN
+    : money(req.body.countedCash);
 
-  if (!Number.isFinite(countedCash) || countedCash < 0) return res.status(400).json({ error: 'Ingresa el efectivo contado en caja.' });
+  if (!Number.isFinite(openingCash) || openingCash < 0) {
+    return res.status(400).json({
+      error: 'La base inicial de caja no es válida.'
+    });
+  }
+
+  if (!Number.isFinite(countedCash) || countedCash < 0) {
+    return res.status(400).json({
+      error: 'Ingresa el efectivo contado en caja.'
+    });
+  }
 
   const summary = summarizeOrders(paid);
 
-  const expectedCash = money(openingCash + summary.cashSales);
+  const expectedCash = money(
+    openingCash + summary.cashSales
+  );
 
   const now = new Date().toISOString();
 
@@ -847,7 +1289,10 @@ app.post('/api/closings', (req, res) => {
     id: nextId(db, 'closing'),
     businessDate: localDay(now),
     closedAt: now,
-    closedBy: { id: req.user.id, name: req.user.name },
+    closedBy: {
+      id: req.user.id,
+      name: req.user.name
+    },
     ...periodOf(paid),
     ...summary,
     cancelledCount: cancelled.length,
@@ -860,47 +1305,97 @@ app.post('/api/closings', (req, res) => {
     orderIds: paid.map(o => o.id)
   };
 
-  for (const o of paid) o.closingId = closing.id;
+  for (const o of paid) {
+    o.closingId = closing.id;
+  }
 
-  for (const o of cancelled) o.closingId = closing.id;
+  for (const o of cancelled) {
+    o.closingId = closing.id;
+  }
 
   db.closings.push(closing);
 
-  writeDB(db);
+  await writeDB(db);
 
   res.status(201).json(closing);
-});
+}));
 
-app.get('/api/closings', requireAdmin, (req, res) => {
-  const db = readDB();
+app.get('/api/closings', requireAdmin, asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
-  const list = [...db.closings].sort((a, b) => b.id - a.id).map(({ orderIds, ...rest }) => rest);
+  const list = [...db.closings]
+    .sort((a, b) => b.id - a.id)
+    .map(({ orderIds, ...rest }) => rest);
 
   res.json(list);
-});
+}));
 
-app.get('/api/closings/:id', requireAdmin, (req, res) => {
-  const db = readDB();
+app.get('/api/closings/:id', requireAdmin, asyncHandler(async (req, res) => {
+  const db = req.db || await readDB();
 
-  const closing = db.closings.find(c => c.id === Number(req.params.id));
+  const closing = db.closings.find(
+    c => c.id === Number(req.params.id)
+  );
 
-  if (!closing) return res.status(404).json({ error: 'Cierre no encontrado.' });
+  if (!closing) {
+    return res.status(404).json({
+      error: 'Cierre no encontrado.'
+    });
+  }
 
   const orders = db.orders
     .filter(o => (closing.orderIds || []).includes(o.id))
-    .map(o => ({ id: o.id, type: o.type, total: o.total, closedAt: o.closedAt, paymentMethod: o.paymentMethod }));
+    .map(o => ({
+      id: o.id,
+      type: o.type,
+      total: o.total,
+      closedAt: o.closedAt,
+      paymentMethod: o.paymentMethod
+    }));
 
-  res.json({ ...closing, orders });
+  res.json({
+    ...closing,
+    orders
+  });
+}));
+
+/* ============ MANEJO DE ERRORES ============ */
+
+app.use((err, req, res, next) => {
+  console.error('Error del servidor:', err.message);
+
+  if (res.headersSent) {
+    return next(err);
+  }
+
+  if (err.status === 409) {
+    return res.status(409).json({
+      error: err.message
+    });
+  }
+
+  res.status(500).json({
+    error: 'No se pudo completar la operación. Intenta nuevamente.'
+  });
 });
 
 /* ============ INICIO DEL SERVIDOR ============ */
 
+async function startServer() {
+  await ensureDB();
+  await repairDB();
 
-if (require.main === module && !process.env.VERCEL) {
   app.listen(PORT, () => {
     console.log(`\nSistema de ventas corriendo en: http://localhost:${PORT}`);
     console.log(`Zona horaria del negocio: ${TIMEZONE}`);
     console.log('Para usarlo desde otro dispositivo en la misma red, usa la IP de esta computadora.\n');
+  });
+}
+
+if (require.main === module && !process.env.VERCEL) {
+  startServer().catch(error => {
+    console.error('Error al iniciar:', error.message);
+    process.exit(1);
   });
 }
 
